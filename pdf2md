@@ -1,0 +1,145 @@
+#!/bin/bash
+# pdf2md — convert a PDF into a Markdown file next to it.
+#
+# Engine: uses docling (layout-aware: tables, headings, lists) when it is
+# installed; otherwise falls back to pdftotext, running OCR first (ocrmypdf)
+# when the PDF has no text layer. Force the fallback with PDF2MD_ENGINE=basic.
+#
+# Usage: pdf2md <file.pdf>
+# Needs: docling  — or —  poppler (pdftotext) + python3, plus ocrmypdf and
+#        tesseract (with the languages in PDF2MD_OCR_LANGS) for scanned PDFs.
+
+set -euo pipefail
+
+if [ $# -lt 1 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    echo "Usage: pdf2md <file.pdf>   (PDF2MD_ENGINE=basic to skip docling)"
+    exit 1
+fi
+
+INPUT="$1"
+[ -f "$INPUT" ] || { echo "Error: file not found: $INPUT"; exit 1; }
+
+ext="$(printf '%s' "${INPUT##*.}" | tr '[:upper:]' '[:lower:]')"
+[ "$ext" = "pdf" ] || { echo "Error: not a PDF: $INPUT"; exit 1; }
+
+DIR="$(dirname "$INPUT")"
+NAME="$(basename "$INPUT")"
+BASE="${NAME%.*}"
+OUTPUT="$DIR/$BASE.md"
+OCR_LANGS="${PDF2MD_OCR_LANGS:-spa+eng}"
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+echo "PDF:      $INPUT"
+echo "Markdown: $OUTPUT"
+
+# --- Engine 1: docling -------------------------------------------------------
+# Apple Silicon: docling's layout model crashes on the MPS (GPU) backend
+# ("MPS framework doesn't support float64"), so default to CPU on macOS.
+# Override with PDF2MD_DOCLING_DEVICE=auto|cpu|mps|cuda.
+if [ "$(uname -s)" = "Darwin" ]; then default_device="cpu"; else default_device="auto"; fi
+DEVICE="${PDF2MD_DOCLING_DEVICE:-$default_device}"
+
+# Page count (for progress and the timeout) and text-layer check, if poppler is there.
+PAGES=""
+if command -v pdfinfo >/dev/null 2>&1; then
+    PAGES="$(pdfinfo "$INPUT" 2>/dev/null | awk '/^Pages:/ {print $2}' || true)"
+fi
+HAS_TEXT="unknown"
+if command -v pdftotext >/dev/null 2>&1; then
+    if [ -n "$(pdftotext -l 5 "$INPUT" - 2>/dev/null | tr -d '[:space:]')" ]; then HAS_TEXT="yes"; else HAS_TEXT="no"; fi
+fi
+
+# Timeout: 30 s per page on CPU, at least 15 min. Override with PDF2MD_DOCLING_TIMEOUT.
+default_timeout=900
+if [ -n "$PAGES" ] && [ $((PAGES * 30)) -gt $default_timeout ]; then default_timeout=$((PAGES * 30)); fi
+TIMEOUT="${PDF2MD_DOCLING_TIMEOUT:-$default_timeout}"
+
+if [ "${PDF2MD_ENGINE:-auto}" != "basic" ] && command -v docling >/dev/null 2>&1; then
+    THREADS="$( (sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4) | head -n1)"
+    # OCR is the slowest stage; skip it when the PDF already has a text layer
+    # (force it with PDF2MD_OCR=1).
+    if [ "$HAS_TEXT" = "yes" ] && [ "${PDF2MD_OCR:-0}" != "1" ]; then OCR_FLAG="--no-ocr"; else OCR_FLAG="--ocr"; fi
+
+    echo "Converting with docling (${PAGES:-?} pages, device: $DEVICE, $THREADS threads, ${OCR_FLAG#--})..."
+    docling --to md --output "$tmp" --device "$DEVICE" --num-threads "$THREADS" \
+        "$OCR_FLAG" --table-mode fast --image-export-mode placeholder \
+        --abort-on-error --document-timeout "$TIMEOUT" "$INPUT" &
+    pid=$!
+    trap 'kill "$pid" 2>/dev/null; rm -rf "$tmp"; exit 130' INT TERM
+
+    start=$(date +%s)
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 5
+        elapsed=$(( $(date +%s) - start ))
+        if [ $((elapsed % 30)) -lt 5 ] && [ "$elapsed" -ge 30 ]; then
+            echo "  ...still converting (${elapsed}s elapsed, limit ${TIMEOUT}s)"
+        fi
+        if [ "$elapsed" -gt $((TIMEOUT + 60)) ]; then
+            echo "  docling exceeded the time limit; stopping it."
+            kill "$pid" 2>/dev/null
+        fi
+    done
+    trap - INT TERM
+
+    if wait "$pid"; then
+        md="$(find "$tmp" -name '*.md' | head -n1)"
+        if [ -n "$md" ] && [ -s "$md" ]; then
+            mv "$md" "$OUTPUT"
+            echo "Done in $(( $(date +%s) - start ))s: $OUTPUT"
+            exit 0
+        fi
+    fi
+    echo "docling failed; falling back to the basic engine."
+fi
+
+# --- Engine 2: pdftotext (+ OCR for scans) -----------------------------------
+command -v pdftotext >/dev/null 2>&1 || { echo "Error: needs docling or pdftotext (poppler)"; exit 1; }
+
+SOURCE="$INPUT"
+if [ -z "$(pdftotext "$INPUT" - 2>/dev/null | tr -d '[:space:]')" ]; then
+    command -v ocrmypdf >/dev/null 2>&1 || { echo "Error: scanned PDF, and ocrmypdf is not installed"; exit 1; }
+    echo "No text layer found; running OCR ($OCR_LANGS)..."
+    ocrmypdf --skip-text --deskew --clean -l "$OCR_LANGS" "$INPUT" "$tmp/ocr.pdf"
+    SOURCE="$tmp/ocr.pdf"
+fi
+
+echo "Extracting text..."
+pdftotext -layout "$SOURCE" "$tmp/text.txt"
+
+python3 - "$tmp/text.txt" "$OUTPUT" "$BASE" <<'PY'
+import re, sys
+
+src, out, base = sys.argv[1:4]
+with open(src, encoding="utf-8", errors="replace") as f:
+    text = f.read().replace("\r\n", "\n").replace("\r", "\n")
+
+lines, blank = [], False
+for line in (l.rstrip() for l in text.split("\n")):
+    if not line.strip():
+        if not blank:
+            lines.append("")
+        blank = True
+    else:
+        lines.append(line)
+        blank = False
+
+md = []
+for line in "\n".join(lines).strip().split("\n"):
+    s = line.strip()
+    words = s.split()
+    # Heuristic heading: a short ALL-CAPS line of 2-12 words.
+    # (Single words like "FPGA" are left alone: usually acronyms, not titles.)
+    if (2 <= len(words) <= 12 and len(s) < 100 and s == s.upper()
+            and re.search(r"[A-ZÁÉÍÓÚÑÜ]", s)):
+        md.append("## " + s.title())
+    else:
+        md.append(line)
+
+title = re.sub(r"[_-]+", " ", base)
+with open(out, "w", encoding="utf-8") as f:
+    f.write("# " + title + "\n\n" + "\n".join(md) + "\n")
+PY
+
+echo "Done: $OUTPUT"

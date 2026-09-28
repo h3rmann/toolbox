@@ -1,0 +1,134 @@
+#!/bin/bash
+# yt2md — turn a YouTube video's subtitles into a Markdown transcript:
+# YAML metadata, chapters (if any), and timestamped paragraphs (~1 per minute).
+# Usage: yt2md <url> [lang]   (lang defaults to "en")
+# Needs: yt-dlp, python3
+
+set -euo pipefail
+
+if [ $# -lt 1 ] || [ -z "${1:-}" ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    echo "Usage: yt2md <url> [lang]   (lang defaults to en)"
+    exit 1
+fi
+
+url="$1"
+lang="${2:-en}"
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+# 1) Metadata only. Lets us pick the right caption track before downloading it.
+yt-dlp --skip-download --write-info-json --ignore-no-formats-error --no-warnings \
+    -o "$tmp/%(title)s.%(ext)s" "$url"
+info="$(find "$tmp" -name '*.info.json' | head -n1)"
+[ -n "$info" ] || { echo "Could not fetch video metadata"; exit 1; }
+
+# 2) Choose the track: manual subs in $lang > original auto-captions ($lang-orig)
+#    > auto-translated $lang. YouTube rate-limits (HTTP 429) the translated
+#    track hard, which is why "-orig" comes before it.
+choice="$(python3 - "$info" "$lang" <<'PY2'
+import json, sys
+info = json.load(open(sys.argv[1], encoding="utf-8")); lang = sys.argv[2]
+subs = info.get("subtitles") or {}; auto = info.get("automatic_captions") or {}
+if lang in subs: print("manual", lang)
+elif f"{lang}-orig" in auto: print("auto", f"{lang}-orig")
+elif lang in auto: print("auto-translated", lang)
+PY2
+)"
+[ -n "$choice" ] || { echo "No subs found for lang=$lang"; exit 1; }
+kind="${choice%% *}"; track="${choice#* }"
+if [ "$kind" = "manual" ]; then subflag="--write-subs"; else subflag="--write-auto-subs"; fi
+
+# 3) Download only that track, reusing the metadata (no second page fetch).
+yt-dlp --load-info-json "$info" "$subflag" --sub-langs "$track" --sub-format "vtt/best" \
+    --convert-subs vtt --skip-download --ignore-no-formats-error --no-warnings \
+    -o "$tmp/%(title)s.%(ext)s"
+
+vtt="$(find "$tmp" -name '*.vtt' | head -n1)"
+if [ -z "$vtt" ]; then
+    echo "Subtitle download failed for $track"
+    exit 1
+fi
+
+out="$(basename "${vtt%.*.vtt}").md"
+
+python3 - "$vtt" "$info" "$out" "$kind" <<'PY'
+import sys, re, json, datetime
+
+vtt_path, info_path, out_path, kind = sys.argv[1:5]
+info = {}
+if info_path:
+    with open(info_path, encoding="utf-8") as f:
+        info = json.load(f)
+
+def secs(ts):
+    s = 0.0
+    for part in ts.split(":"):
+        s = s * 60 + float(part)
+    return s
+
+def fmt(s):
+    s = int(s)
+    h, m, sec = s // 3600, s % 3600 // 60, s % 60
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+# Parse cues: (start_seconds, cleaned_line)
+cues, start = [], None
+with open(vtt_path, encoding="utf-8") as f:
+    for raw in f:
+        line = raw.strip()
+        if "-->" in line:
+            start = secs(line.split("-->")[0].strip())
+            continue
+        if start is None or not line or line.isdigit():
+            continue  # header block, blank lines, cue ids
+        c = re.sub(r"<[^>]*>", "", line)
+        c = (c.replace("&amp;", "&").replace("&gt;", ">")
+              .replace("&lt;", "<").replace("&nbsp;", " ").strip())
+        if c:
+            cues.append((start, c))
+
+# Auto-captions repeat each line across consecutive cues: drop only
+# back-to-back duplicates, then group into ~60-second paragraphs.
+paras, last = [], None
+for t, c in cues:
+    if c == last:
+        continue
+    last = c
+    if not paras or t - paras[-1][0] >= 60:
+        paras.append([t, [c]])
+    else:
+        paras[-1][1].append(c)
+
+lang = vtt_path.rsplit(".", 2)[-2].removesuffix("-orig")
+d = info.get("upload_date")
+meta = {
+    "title": info.get("title") or out_path[:-3],
+    "channel": info.get("channel") or info.get("uploader"),
+    "url": info.get("webpage_url"),
+    "published": f"{d[:4]}-{d[4:6]}-{d[6:]}" if d else None,
+    "duration": fmt(info["duration"]) if info.get("duration") else None,
+    "language": lang,
+    "captions": {"manual": "manual", "auto": "auto-generated", "auto-translated": "auto-translated"}[kind],
+    "fetched": datetime.date.today().isoformat(),
+}
+
+lines = ["---"]
+lines += [f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in meta.items() if v]
+lines += ["---", "", f"# {meta['title']}", ""]
+
+chapters = info.get("chapters") or []
+if chapters:
+    lines += ["## Chapters", ""]
+    lines += [f"- {fmt(ch.get('start_time', 0))} {ch.get('title', '')}" for ch in chapters]
+    lines += [""]
+
+lines += ["## Transcript", ""]
+for t, text in paras:
+    lines += [f"**[{fmt(t)}]** " + " ".join(text), ""]
+
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines))
+PY
+
+echo "→ $out"
