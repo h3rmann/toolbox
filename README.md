@@ -12,7 +12,7 @@ Both are single-file Bash scripts with a small embedded Python step. macOS and L
 ## Install
 
 ```bash
-git clone https://github.com/<you>/toolbox.git ~/toolbox
+git clone https://github.com/h3rmann/toolbox.git ~/toolbox
 echo 'export PATH="$HOME/toolbox:$PATH"' >> ~/.zshrc   # or ~/.bashrc
 ```
 
