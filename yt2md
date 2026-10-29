@@ -1,18 +1,18 @@
 #!/bin/bash
 # yt2md — turn a YouTube video's subtitles into a Markdown transcript:
 # YAML metadata, chapters (if any), and timestamped paragraphs (~1 per minute).
-# Usage: yt2md <url> [lang]   (lang defaults to "en")
+# Usage: yt2md <url> [lang]   (lang defaults to the video's own language, else "en")
 # Needs: yt-dlp, python3
 
 set -euo pipefail
 
 if [ $# -lt 1 ] || [ -z "${1:-}" ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
-    echo "Usage: yt2md <url> [lang]   (lang defaults to en)"
+    echo "Usage: yt2md <url> [lang]   (lang defaults to the video's language, else en)"
     exit 1
 fi
 
 url="$1"
-lang="${2:-en}"
+lang="${2:-}"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -30,12 +30,27 @@ choice="$(python3 - "$info" "$lang" <<'PY2'
 import json, sys
 info = json.load(open(sys.argv[1], encoding="utf-8")); lang = sys.argv[2]
 subs = info.get("subtitles") or {}; auto = info.get("automatic_captions") or {}
+if not subs and not auto:
+    sys.exit(0)  # no captions at all: reported below
+if not lang:
+    # Auto-detect: the video's declared language, else the language of its
+    # original auto-caption track ("xx-orig"), else English.
+    declared = (info.get("language") or "").split("-")[0]
+    orig = next((k[:-5] for k in auto if k.endswith("-orig")), "")
+    lang = declared if declared and (declared in subs or declared in auto or f"{declared}-orig" in auto) else (orig or "en")
 if lang in subs: print("manual", lang)
 elif f"{lang}-orig" in auto: print("auto", f"{lang}-orig")
 elif lang in auto: print("auto-translated", lang)
 PY2
 )"
-[ -n "$choice" ] || { echo "No subs found for lang=$lang"; exit 1; }
+if [ -z "$choice" ]; then
+    if python3 -c 'import json,sys; i=json.load(open(sys.argv[1])); sys.exit(0 if (i.get("subtitles") or i.get("automatic_captions")) else 1)' "$info"; then
+        echo "No subs found for lang=${lang:-auto}"
+    else
+        echo "This video has no captions at all (manual or automatic): yt2md cannot read it"
+    fi
+    exit 1
+fi
 kind="${choice%% *}"; track="${choice#* }"
 if [ "$kind" = "manual" ]; then subflag="--write-subs"; else subflag="--write-auto-subs"; fi
 

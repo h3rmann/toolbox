@@ -43,8 +43,8 @@ On macOS: `brew install poppler ocrmypdf tesseract tesseract-lang`.
 ## yt2md
 
 ```bash
-yt2md https://youtu.be/VIDEO_ID        # English captions (default)
-yt2md https://youtu.be/VIDEO_ID es     # Spanish captions
+yt2md https://youtu.be/VIDEO_ID        # the video's own language (falls back to English)
+yt2md https://youtu.be/VIDEO_ID es     # force Spanish captions
 ```
 
 Writes `<video title>.md` in the current folder:
@@ -72,7 +72,7 @@ fetched: "2026-09-28"
 **[00:00]** First minute of speech...
 ```
 
-**Which captions it picks:** manual captions in the requested language first, then YouTube's original auto-generated track (`<lang>-orig`), and only then the machine-translated track. That order matters: YouTube rate-limits the translated track heavily (HTTP 429), while the original track downloads fine.
+**Which captions it picks:** manual captions in the requested language first, then YouTube's original auto-generated track (`<lang>-orig`), and only then the machine-translated track. That order matters: YouTube rate-limits the translated track heavily (HTTP 429), while the original track downloads fine. Without a language argument it uses the video's own language. Videos with no captions at all are reported and skipped: yt2md reads captions, it does not transcribe audio.
 
 **Requirements:** [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and `python3` (3.9+). On macOS: `brew install yt-dlp`.
 
