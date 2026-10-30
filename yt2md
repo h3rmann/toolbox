@@ -1,67 +1,97 @@
 #!/bin/bash
 # yt2md — turn a YouTube video's subtitles into a Markdown transcript:
 # YAML metadata, chapters (if any), and timestamped paragraphs (~1 per minute).
-# Usage: yt2md <url> [lang]   (lang defaults to the video's own language, else "en")
+# Usage: yt2md <url> [lang]   (lang defaults to "en")
 # Needs: yt-dlp, python3
 
 set -euo pipefail
 
 if [ $# -lt 1 ] || [ -z "${1:-}" ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
-    echo "Usage: yt2md <url> [lang]   (lang defaults to the video's language, else en)"
+    echo "Usage: yt2md <url> [lang]   (lang defaults to en)"
     exit 1
 fi
 
 url="$1"
-lang="${2:-}"
+lang="${2:-en}"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# 1) Metadata only. Lets us pick the right caption track before downloading it.
-yt-dlp --skip-download --write-info-json --ignore-no-formats-error --no-warnings \
-    -o "$tmp/%(title)s.%(ext)s" "$url"
-info="$(find "$tmp" -name '*.info.json' | head -n1)"
-[ -n "$info" ] || { echo "Could not fetch video metadata"; exit 1; }
+# Retries for flaky networks; optional browser cookies when YouTube asks for a sign-in.
+YT_ARGS=(--retries 5 --extractor-retries 3 --no-warnings)
+[ -n "${YT2MD_COOKIES:-}" ] && YT_ARGS+=(--cookies-from-browser "$YT2MD_COOKIES")
 
-# 2) Choose the track: manual subs in $lang > original auto-captions ($lang-orig)
-#    > auto-translated $lang. YouTube rate-limits (HTTP 429) the translated
-#    track hard, which is why "-orig" comes before it.
+# YouTube breaks old yt-dlp versions every few weeks; update with whatever installed it.
+update_ytdlp() {
+    echo "yt2md: updating yt-dlp, then retrying..." >&2
+    if command -v brew >/dev/null 2>&1 && brew list yt-dlp >/dev/null 2>&1; then
+        brew upgrade yt-dlp >/dev/null 2>&1 || true
+    elif command -v pipx >/dev/null 2>&1 && pipx list 2>/dev/null | grep -q yt-dlp; then
+        pipx upgrade yt-dlp >/dev/null 2>&1 || true
+    else
+        yt-dlp -U >/dev/null 2>&1 \
+            || python3 -m pip install -q -U --user --break-system-packages yt-dlp >/dev/null 2>&1 \
+            || true
+    fi
+}
+
+# Run yt-dlp; on 429 wait and retry, on any other first failure update and retry.
+fetch() {
+    local log="$tmp/err.log" attempt
+    for attempt in 1 2 3; do
+        if yt-dlp "${YT_ARGS[@]}" "$@" 2>"$log"; then return 0; fi
+        cat "$log" >&2
+        if grep -qiE "429|too many requests" "$log"; then
+            echo "yt2md: YouTube is throttling (429); waiting $((attempt * 45)) s..." >&2
+            sleep $((attempt * 45))
+        elif grep -qiE "not a bot|sign in to confirm" "$log"; then
+            echo "yt2md: YouTube wants a sign-in. Retry with: YT2MD_COOKIES=chrome yt2md <url>" >&2
+            return 1
+        elif [ "$attempt" = 1 ]; then
+            update_ytdlp
+        else
+            return 1
+        fi
+    done
+    return 1
+}
+
+# 1) Metadata only. Lets us pick the right caption track before downloading it.
+fetch --skip-download --write-info-json --ignore-no-formats-error \
+    -o "$tmp/%(title)s.%(ext)s" "$url" || { echo "yt2md: could not fetch video metadata" >&2; exit 1; }
+info="$(find "$tmp" -name '*.info.json' | head -n1)"
+[ -n "$info" ] || { echo "yt2md: could not fetch video metadata" >&2; exit 1; }
+
+# 2) Choose the track: $lang (manual > auto) > the video's own language
+#    (manual > auto) > auto-translated $lang as a last resort. YouTube
+#    rate-limits (HTTP 429) translated tracks hard, so they come last.
 choice="$(python3 - "$info" "$lang" <<'PY2'
 import json, sys
 info = json.load(open(sys.argv[1], encoding="utf-8")); lang = sys.argv[2]
 subs = info.get("subtitles") or {}; auto = info.get("automatic_captions") or {}
-if not subs and not auto:
-    sys.exit(0)  # no captions at all: reported below
-if not lang:
-    # Auto-detect: the video's declared language, else the language of its
-    # original auto-caption track ("xx-orig"), else English.
-    declared = (info.get("language") or "").split("-")[0]
-    orig = next((k[:-5] for k in auto if k.endswith("-orig")), "")
-    lang = declared if declared and (declared in subs or declared in auto or f"{declared}-orig" in auto) else (orig or "en")
+subs.pop("live_chat", None)
+orig = info.get("language") or next((k[:-5] for k in auto if k.endswith("-orig")), None)
 if lang in subs: print("manual", lang)
 elif f"{lang}-orig" in auto: print("auto", f"{lang}-orig")
+elif orig and orig in subs: print("manual", orig)
+elif orig and f"{orig}-orig" in auto: print("auto", f"{orig}-orig")
 elif lang in auto: print("auto-translated", lang)
+elif len(subs) == 1: print("manual", next(iter(subs)))
 PY2
 )"
-if [ -z "$choice" ]; then
-    if python3 -c 'import json,sys; i=json.load(open(sys.argv[1])); sys.exit(0 if (i.get("subtitles") or i.get("automatic_captions")) else 1)' "$info"; then
-        echo "No subs found for lang=${lang:-auto}"
-    else
-        echo "This video has no captions at all (manual or automatic): yt2md cannot read it"
-    fi
-    exit 1
-fi
+[ -n "$choice" ] || { echo "yt2md: this video has no usable captions (lang=$lang)" >&2; exit 1; }
+case "$choice" in *" $lang"|*" $lang-orig") ;; *) echo "yt2md: no $lang track; using ${choice#* }" >&2 ;; esac
 kind="${choice%% *}"; track="${choice#* }"
 if [ "$kind" = "manual" ]; then subflag="--write-subs"; else subflag="--write-auto-subs"; fi
 
 # 3) Download only that track, reusing the metadata (no second page fetch).
-yt-dlp --load-info-json "$info" "$subflag" --sub-langs "$track" --sub-format "vtt/best" \
-    --convert-subs vtt --skip-download --ignore-no-formats-error --no-warnings \
-    -o "$tmp/%(title)s.%(ext)s"
+fetch --load-info-json "$info" "$subflag" --sub-langs "$track" --sub-format "vtt/best" \
+    --convert-subs vtt --skip-download --ignore-no-formats-error \
+    -o "$tmp/%(title)s.%(ext)s" || true
 
 vtt="$(find "$tmp" -name '*.vtt' | head -n1)"
 if [ -z "$vtt" ]; then
-    echo "Subtitle download failed for $track"
+    echo "yt2md: subtitle download failed for $track" >&2
     exit 1
 fi
 
