@@ -1,18 +1,18 @@
 #!/bin/bash
 # yt2md — turn a YouTube video's subtitles into a Markdown transcript:
 # YAML metadata, chapters (if any), and timestamped paragraphs (~1 per minute).
-# Usage: yt2md <url> [lang]   (lang defaults to "en")
+# Usage: yt2md <url> [lang]   (lang defaults to the video's own language, else "en")
 # Needs: yt-dlp, python3
 
 set -euo pipefail
 
 if [ $# -lt 1 ] || [ -z "${1:-}" ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
-    echo "Usage: yt2md <url> [lang]   (lang defaults to en)"
+    echo "Usage: yt2md <url> [lang]   (lang defaults to the video's language, else en)"
     exit 1
 fi
 
 url="$1"
-lang="${2:-en}"
+lang="${2:-}"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -62,25 +62,38 @@ fetch --skip-download --write-info-json --ignore-no-formats-error \
 info="$(find "$tmp" -name '*.info.json' | head -n1)"
 [ -n "$info" ] || { echo "yt2md: could not fetch video metadata" >&2; exit 1; }
 
-# 2) Choose the track: $lang (manual > auto) > the video's own language
-#    (manual > auto) > auto-translated $lang as a last resort. YouTube
-#    rate-limits (HTTP 429) translated tracks hard, so they come last.
+# 2) Choose the track. Without [lang]: the video's declared language, else the
+#    language of its original auto-caption track ("xx-orig"), else English.
+#    Within a language: manual > original auto-captions (-orig) > auto-translated.
+#    YouTube rate-limits (HTTP 429) translated tracks hard, so they come last.
 choice="$(python3 - "$info" "$lang" <<'PY2'
 import json, sys
 info = json.load(open(sys.argv[1], encoding="utf-8")); lang = sys.argv[2]
 subs = info.get("subtitles") or {}; auto = info.get("automatic_captions") or {}
 subs.pop("live_chat", None)
-orig = info.get("language") or next((k[:-5] for k in auto if k.endswith("-orig")), None)
+if not subs and not auto:
+    sys.exit(0)  # no captions at all: reported below
+declared = (info.get("language") or "").split("-")[0]
+orig = next((k[:-5] for k in auto if k.endswith("-orig")), "")
+if not lang:
+    lang = declared if declared and (declared in subs or declared in auto or f"{declared}-orig" in auto) else (orig or "en")
 if lang in subs: print("manual", lang)
 elif f"{lang}-orig" in auto: print("auto", f"{lang}-orig")
-elif orig and orig in subs: print("manual", orig)
+elif declared and declared in subs: print("manual", declared)
 elif orig and f"{orig}-orig" in auto: print("auto", f"{orig}-orig")
 elif lang in auto: print("auto-translated", lang)
 elif len(subs) == 1: print("manual", next(iter(subs)))
 PY2
 )"
-[ -n "$choice" ] || { echo "yt2md: this video has no usable captions (lang=$lang)" >&2; exit 1; }
-case "$choice" in *" $lang"|*" $lang-orig") ;; *) echo "yt2md: no $lang track; using ${choice#* }" >&2 ;; esac
+if [ -z "$choice" ]; then
+    if python3 -c 'import json,sys; i=json.load(open(sys.argv[1])); sys.exit(0 if (i.get("subtitles") or i.get("automatic_captions")) else 1)' "$info"; then
+        echo "yt2md: no usable captions for lang=${lang:-auto}" >&2
+    else
+        echo "yt2md: this video has no captions at all (manual or automatic): yt2md cannot read it" >&2
+    fi
+    exit 1
+fi
+[ -z "$lang" ] || case "$choice" in *" $lang"|*" $lang-orig") ;; *) echo "yt2md: no $lang track; using ${choice#* }" >&2 ;; esac
 kind="${choice%% *}"; track="${choice#* }"
 if [ "$kind" = "manual" ]; then subflag="--write-subs"; else subflag="--write-auto-subs"; fi
 
